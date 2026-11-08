@@ -734,6 +734,51 @@ func TestPartsCompleteKnowsAnOlderObject(t *testing.T) {
 	}
 }
 
+// settled is whether every upload not completed has been aborted, which for one left behind
+// happens meanwhile.
+func settled(fake *fakeS3) bool {
+	for range 100 {
+		if fake.open() == 0 {
+			return true
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return false
+}
+
+// A store holds every attempt at one part number of an upload as long as the first, so a held only
+// part goes again in a new upload, and the old upload is aborted.
+func TestPartsHeldOnlyPartGoesInANewUpload(t *testing.T) {
+	shortDeadlines(t)
+
+	fake := newFakeS3()
+	fake.hook = func(ctx context.Context, op string, _ int64, attempt int) error {
+		if op == "part" && attempt <= 2 {
+			return held(ctx)
+		}
+
+		return nil
+	}
+	data := random(t, 1000)
+
+	upload, err := newTestParts(fake).upload(context.Background(), "/blob", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := upload.Complete(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(content(t, fake, "/blob"), data) || upload.Size() != int64(len(data)) ||
+		fake.count("create") != 3 || fake.count("part") != 3 || !settled(fake) || fake.count("abort") != 2 {
+		t.Fatalf("%d uploads created, %d part attempts, %d aborted, %d open",
+			fake.count("create"), fake.count("part"), fake.count("abort"), fake.open())
+	}
+}
+
 // A Complete of one part has a part's deadline, not the minutes of one that puts many together.
 func TestPartsCompleteOfOnePartHasAPartsDeadline(t *testing.T) {
 	shortDeadlines(t)
@@ -865,9 +910,11 @@ func TestPartsPutFromMemory(t *testing.T) {
 			t.Fatalf("size %d: %v", size, err)
 		}
 
+		// The only part of an upload is sent again in a new one.
 		parts := max(1, (size+partSize-1)/partSize)
-		if !bytes.Equal(content(t, fake, "/index.json"), data) || fake.count("create") != 1 ||
-			fake.count("part") != parts+1 || fake.attempt("part", 1) != 2 || fake.open() != 0 || p.made != 0 {
+		creates := map[bool]int{true: 2, false: 1}[parts == 1]
+		if !bytes.Equal(content(t, fake, "/index.json"), data) || fake.count("create") != creates ||
+			fake.count("part") != parts+1 || fake.attempt("part", 1) != 2 || !settled(fake) || p.made != 0 {
 			t.Fatalf("size %d: %d uploads created, %d part attempts, %d of part 1, %d open, %d buffers made",
 				size, fake.count("create"), fake.count("part"), fake.attempt("part", 1), fake.open(), p.made)
 		}

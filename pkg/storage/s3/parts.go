@@ -42,6 +42,11 @@ import (
 // was there for minutes and then gone. An upload's parts are its own objects until it completes,
 // and the store completes an upload once.
 //
+// A store holds every attempt at one part number of an upload for as long as it holds the first,
+// up to a minute or more, and an upload completes only with every part sent to it, so a part of
+// many is sent again under its number. The only part of an upload is sent again in a new upload
+// instead, as a part that lands in an upload nothing completes changes nothing.
+//
 // zot's own files, manifests and index.json, are written whole from memory, and go the same way,
 // their parts sent straight from that memory. The upstream driver writes them with no deadline, and
 // a held index.json, written under the store lock, stops every other write to the store with it.
@@ -248,9 +253,15 @@ func (p *parts) upload(ctx context.Context, path string, body io.Reader) (storag
 		return nil, err
 	}
 
-	err = up.send(ctx, func(ctx context.Context, jobs chan<- part) error {
-		return up.read(ctx, jobs, first, first[:n], body)
-	})
+	if n < partSize {
+		err = up.sendOnly(ctx, first[:n])
+		p.buffers <- first
+	} else {
+		err = up.send(ctx, func(ctx context.Context, jobs chan<- part) error {
+			return up.read(ctx, jobs, first, first[:n], body)
+		})
+	}
+
 	if err != nil {
 		up.Abort()
 
@@ -272,21 +283,26 @@ func (p *parts) put(ctx context.Context, path string, content []byte) error {
 		return err
 	}
 
-	err := up.send(ctx, func(ctx context.Context, jobs chan<- part) error {
-		// An empty content is one empty part.
-		for number, first := int64(1), 0; number == 1 || first < len(content); number, first = number+1, first+partSize {
-			data := content[first:min(first+partSize, len(content))]
+	var err error
+	if len(content) <= partSize {
+		err = up.sendOnly(ctx, content)
+	} else {
+		err = up.send(ctx, func(ctx context.Context, jobs chan<- part) error {
+			for number, first := int64(1), 0; first < len(content); number, first = number+1, first+partSize {
+				data := content[first:min(first+partSize, len(content))]
 
-			select {
-			case jobs <- part{number: number, data: data}:
-				up.size += int64(len(data))
-			case <-ctx.Done():
-				return ctx.Err()
+				select {
+				case jobs <- part{number: number, data: data}:
+					up.size += int64(len(data))
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
-		}
 
-		return nil
-	})
+			return nil
+		})
+	}
+
 	if err == nil {
 		err = up.Complete()
 	}
@@ -499,13 +515,50 @@ func (up *partsUpload) Size() int64 {
 }
 
 func (up *partsUpload) create(ctx context.Context) error {
-	return try(ctx, "start upload of "+up.key, partPolicy, func(ctx context.Context) error {
-		out, err := up.parts.client.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
-			Bucket: aws.String(up.parts.bucket), Key: aws.String(up.key),
-			ContentType: aws.String("application/octet-stream"),
+	return try(ctx, "start upload of "+up.key, partPolicy, up.start)
+}
+
+// start makes one attempt at starting the upload.
+func (up *partsUpload) start(ctx context.Context) error {
+	out, err := up.parts.client.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(up.parts.bucket), Key: aws.String(up.key),
+		ContentType: aws.String("application/octet-stream"),
+	})
+	if err == nil {
+		up.id = aws.StringValue(out.UploadId)
+	}
+
+	return err
+}
+
+// sendOnly uploads data, which may be empty, as the only part of the upload. An attempt the store
+// held is sent again in a new upload, and the old one, which nothing will complete, is aborted
+// meanwhile.
+func (up *partsUpload) sendOnly(ctx context.Context, data []byte) error {
+	p := up.parts
+	up.size = int64(len(data))
+
+	return try(ctx, "upload the part of "+up.key, partPolicy, func(ctx context.Context) error {
+		if up.id == "" {
+			if err := up.start(ctx); err != nil {
+				return err
+			}
+		}
+
+		out, err := p.client.UploadPartWithContext(ctx, &s3.UploadPartInput{
+			Bucket: aws.String(p.bucket), Key: aws.String(up.key), UploadId: aws.String(up.id),
+			PartNumber: aws.Int64(1), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data))),
 		})
 		if err == nil {
-			up.id = aws.StringValue(out.UploadId)
+			up.done = []*s3.CompletedPart{{ETag: out.ETag, PartNumber: aws.Int64(1)}}
+
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			go (&partsUpload{parts: p, key: up.key, id: up.id}).Abort()
+
+			up.id = ""
 		}
 
 		return err
