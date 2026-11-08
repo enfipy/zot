@@ -15,6 +15,7 @@ import (
 
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 	"zotregistry.dev/zot/v2/pkg/storage/errclass"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
 
 type Driver struct {
@@ -23,6 +24,37 @@ type Driver struct {
 
 func New(storeDriver storagedriver.StorageDriver) *Driver {
 	return &Driver{store: storeDriver}
+}
+
+// partsDriver is a Driver that also writes and copies whole blobs in parallel parts (parts.go).
+type partsDriver struct {
+	*Driver
+	parts *parts
+}
+
+// NewWithParts is New, with whole blobs written and copied in parallel parts through a client
+// made from params, the storage driver's parameters.
+func NewWithParts(storeDriver storagedriver.StorageDriver, params map[string]any) (storageTypes.PartsDriver, error) {
+	parts, err := newParts(storeDriver, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return &partsDriver{Driver: New(storeDriver), parts: parts}, nil
+}
+
+func (driver *partsDriver) UploadParts(ctx context.Context, path string, body io.Reader,
+) (storageTypes.PartsUpload, error) {
+	upload, err := driver.parts.upload(ctx, path, body)
+
+	return upload, driver.formatErr(err, path)
+}
+
+func (driver *partsDriver) CopyParts(ctx context.Context, src, dst string, size int64,
+) (storageTypes.PartsUpload, error) {
+	upload, err := driver.parts.copy(ctx, src, dst, size)
+
+	return upload, driver.formatErr(err, src)
 }
 
 func (driver *Driver) Name() string {

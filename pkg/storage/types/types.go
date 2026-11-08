@@ -132,3 +132,23 @@ type Driver interface { //nolint:interfacebloat
 	Link(src, dest string) error
 	RedirectURL(r *http.Request, path string) (string, error)
 }
+
+// PartsDriver is a driver that writes and copies a whole blob straight to its place, as an
+// upload that publishes the blob only when completed.
+type PartsDriver interface {
+	Driver
+	UploadParts(ctx context.Context, path string, body io.Reader) (PartsUpload, error)
+	CopyParts(ctx context.Context, src, dst string, size int64) (PartsUpload, error)
+}
+
+// PartsUpload is a blob written but not yet published.
+type PartsUpload interface {
+	Size() int64
+	Complete() error
+	Abort()
+}
+
+// BlobCopier is an image store that copies a blob from one of its repositories to another.
+type BlobCopier interface {
+	CopyBlob(ctx context.Context, source, repo string, digest godigest.Digest) (int64, error)
+}

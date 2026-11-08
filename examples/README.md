@@ -163,6 +163,21 @@ outside the store lock, one at a time per blob and repository, and finishes even
 when the client gives up first. It needs MetaDB, which zot keeps when search,
 basic authentication, retention, quotas or image trust are enabled.
 
+On S3 without `dedupe`, a whole blob whose digest is known, as a monolithic
+upload, a synced layer or such a copy, is written as a multipart upload straight
+to its place, sixteen 8 MiB parts at a time, and the upload is completed, which
+publishes the blob at once, only after its digest is checked. A blob that fits
+in one part is an upload of one part too, as a store that held a PutObject may
+fail it minutes later and remove what a later attempt put. A request that
+gets no answer within its deadline (5 seconds for a part at first, two minutes
+for a copied part, growing by half after each such attempt) is sent again at
+once, and one answered with an error after a growing wait, for up to 15
+minutes, as a store can hold every request for one key for minutes. A copy is
+made on the storage's side, part by part. Neither is staged under `.uploads`
+and moved.
+These requests go over HTTP/1.1, a connection each, since over HTTP/2 they would
+share one connection whose flow-control window held parts can use up.
+
 When an image is deleted (either by tag or reference), orphaned blobs can lead
 to wasted storage, and background garbage collection can be enabled with:
 

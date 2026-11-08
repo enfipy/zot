@@ -1751,6 +1751,12 @@ func (is *ImageStore) FullBlobUpload(ctx context.Context, repo string, body io.R
 		return "", -1, err
 	}
 
+	if partsDriver, ok := is.storeDriver.(storageTypes.PartsDriver); ok && !is.dedupe {
+		size, err := is.uploadParts(ctx, partsDriver, repo, body, dstDigest)
+
+		return uuid, size, err
+	}
+
 	dstDigestAlgorithm := dstDigest.Algorithm()
 
 	digester := dstDigestAlgorithm.Hash()
@@ -1853,6 +1859,117 @@ func (is *ImageStore) FullBlobUpload(ctx context.Context, repo string, body io.R
 	cleanupStaging = false
 
 	return uuid, nbytes, nil
+}
+
+// uploadParts writes a whole blob straight to its place, checking its digest as it is read, and
+// publishes it where a move of the upload would be.
+func (is *ImageStore) uploadParts(ctx context.Context, driver storageTypes.PartsDriver, repo string,
+	body io.Reader, dstDigest godigest.Digest,
+) (int64, error) {
+	digester := dstDigest.Algorithm().Hash()
+	dst := is.BlobPath(repo, dstDigest)
+
+	upload, err := driver.UploadParts(ctx, dst, io.TeeReader(body, digester))
+	if err != nil {
+		is.log.Error().Err(err).Str("blob", dst).Msg("failed to write blob")
+
+		return -1, err
+	}
+
+	srcDigest := godigest.NewDigestFromEncoded(dstDigest.Algorithm(), hex.EncodeToString(digester.Sum(nil)))
+	if srcDigest != dstDigest {
+		upload.Abort()
+		is.log.Error().Str("srcDigest", srcDigest.String()).
+			Str("dstDigest", dstDigest.String()).Msg("actual digest not equal to expected digest")
+
+		return -1, zerr.ErrBadBlobDigest
+	}
+
+	return upload.Size(), is.publishParts(ctx, repo, dst, upload)
+}
+
+// publishParts completes upload under the store lock, after recreating the repository's layout,
+// as finishing a move of an upload does.
+func (is *ImageStore) publishParts(ctx context.Context, repo, dst string, upload storageTypes.PartsUpload) error {
+	var lockLatency time.Time
+
+	is.Lock(&lockLatency)
+	defer is.Unlock(&lockLatency)
+
+	if err := is.initRepo(ctx, repo); err != nil {
+		upload.Abort()
+
+		return err
+	}
+
+	if err := upload.Complete(); err != nil {
+		upload.Abort()
+		is.log.Error().Err(err).Str("blob", dst).Msg("failed to finish blob")
+
+		return err
+	}
+
+	return nil
+}
+
+// CopyBlob copies digest's blob from the source repository to repo. A driver that copies whole
+// blobs copies it on the storage's side, from the blob as it was checked when written; otherwise
+// it is read and uploaded again.
+func (is *ImageStore) CopyBlob(ctx context.Context, source, repo string, digest godigest.Digest) (int64, error) {
+	driver, ok := is.storeDriver.(storageTypes.PartsDriver)
+	if !ok || is.dedupe {
+		reader, _, err := is.GetBlob(source, digest, ispec.MediaTypeImageLayer)
+		if err != nil {
+			return -1, err
+		}
+		defer reader.Close()
+
+		_, size, err := is.FullBlobUpload(ctx, repo, reader, digest)
+
+		return size, err
+	}
+
+	if err := digest.Validate(); err != nil {
+		return -1, err
+	}
+
+	var lockLatency time.Time
+
+	is.RLock(&lockLatency)
+	binfo, err := is.originalBlobInfo(source, digest)
+	is.RUnlock(&lockLatency)
+
+	if err != nil {
+		return -1, err
+	}
+
+	u, err := guuid.NewV4()
+	if err != nil {
+		return -1, err
+	}
+
+	// Hold the in-progress mark as a monolithic upload does, so the repository is kept until the
+	// copy is in its blob store.
+	mark := is.BlobUploadPath(repo, u.String())
+	if err := is.uploads.startInProgress(mark); err != nil {
+		return -1, err
+	}
+	defer is.uploads.finishInProgress(mark)
+
+	if err := is.prepareBlobUploadDir(ctx, repo); err != nil {
+		return -1, err
+	}
+
+	dst := is.BlobPath(repo, digest)
+
+	upload, err := driver.CopyParts(ctx, binfo.Path(), dst, binfo.Size())
+	if err != nil {
+		is.log.Error().Err(err).Str("blob", binfo.Path()).Str("dst", dst).Msg("failed to copy blob")
+
+		return -1, mapStorageErr(err)
+	}
+
+	return binfo.Size(), is.publishParts(ctx, repo, dst, upload)
 }
 
 // DedupeBlob's repo argument is unused: the shared content is checked against the verified

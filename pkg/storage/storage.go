@@ -100,7 +100,7 @@ func New(config *config.Config, linter common.Lint, metrics monitoring.MetricSer
 		case constants.S3StorageDriverName:
 			defaultStore = s3.NewImageStore(rootDir, config.Storage.RootDirectory,
 				config.Storage.Dedupe, config.Storage.Commit, log, metrics, linter, store, cacheDriver,
-				config.HTTP.Compat, recorder)
+				config.HTTP.Compat, recorder, config.Storage.StorageDriver)
 		case constants.AzureStorageDriverName:
 			defaultStore = azure.NewImageStore(rootDir, config.Storage.RootDirectory,
 				config.Storage.Dedupe, config.Storage.Commit, log, metrics, linter, store, cacheDriver,
@@ -238,6 +238,7 @@ func getSubStore(cfg *config.Config, subPaths map[string]config.StorageConfig,
 			case constants.S3StorageDriverName:
 				subImageStore[route] = s3.NewImageStore(rootDir, storageConfig.RootDirectory,
 					storageConfig.Dedupe, storageConfig.Commit, log, metrics, linter, store, cacheDriver, cfg.HTTP.Compat, recorder,
+					storageConfig.StorageDriver,
 				)
 			case constants.AzureStorageDriverName:
 				subImageStore[route] = azure.NewImageStore(rootDir, storageConfig.RootDirectory,

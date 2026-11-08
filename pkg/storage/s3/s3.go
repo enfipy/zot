@@ -17,11 +17,25 @@ import (
 
 // NewImageStore returns a new image store backed by cloud storages.
 // see https://github.com/docker/docker.github.io/tree/master/registry/storage-drivers
-// Use the last argument to properly set a cache database, or it will default to boltDB local storage.
+// Use cacheDriver to properly set a cache database, or it will default to boltDB local storage.
+// With params, the storage driver's parameters, whole blobs are written and copied in parallel
+// parts (parts.go); without them, or when they make no client, through store alone.
 func NewImageStore(rootDir string, cacheDir string, dedupe, commit bool, log zlog.Logger,
 	metrics monitoring.MetricServer, linter common.Lint, store driver.StorageDriver,
 	cacheDriver storageTypes.Cache, compat []compat.MediaCompatibility, recorder events.Recorder,
+	params ...map[string]any,
 ) storageTypes.ImageStore {
+	var storeDriver storageTypes.Driver = New(store)
+
+	if len(params) > 0 && params[0] != nil {
+		withParts, err := NewWithParts(store, params[0])
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to make a client for parallel parts; blobs are written one part at a time")
+		} else {
+			storeDriver = withParts
+		}
+	}
+
 	return imagestore.NewImageStore(
 		rootDir,
 		cacheDir,
@@ -30,7 +44,7 @@ func NewImageStore(rootDir string, cacheDir string, dedupe, commit bool, log zlo
 		log,
 		metrics,
 		linter,
-		New(store),
+		storeDriver,
 		cacheDriver,
 		compat,
 		recorder,

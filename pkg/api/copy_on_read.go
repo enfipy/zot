@@ -123,13 +123,7 @@ func (rh *RouteHandler) copyBlob(ctx context.Context, imgStore storageTypes.Imag
 
 	start := time.Now()
 
-	reader, _, err := imgStore.GetBlob(source, digest, ispec.MediaTypeImageLayer)
-	if err != nil {
-		return -1, err
-	}
-	defer reader.Close()
-
-	_, size, err := imgStore.FullBlobUpload(ctx, repo, reader, digest)
+	size, err := copyBlobFrom(ctx, imgStore, source, repo, digest)
 	if err != nil {
 		return -1, err
 	}
@@ -138,6 +132,26 @@ func (rh *RouteHandler) copyBlob(ctx context.Context, imgStore storageTypes.Imag
 		Int64("size", size).Str("duration", time.Since(start).String()).Msg("copied blob on read")
 
 	return size, nil
+}
+
+// copyBlobFrom copies through the store when it can copy, which may copy on the storage's side;
+// otherwise it reads the blob and uploads it again.
+func copyBlobFrom(ctx context.Context, imgStore storageTypes.ImageStore, source, repo string,
+	digest godigest.Digest,
+) (int64, error) {
+	if copier, ok := imgStore.(storageTypes.BlobCopier); ok {
+		return copier.CopyBlob(ctx, source, repo, digest)
+	}
+
+	reader, _, err := imgStore.GetBlob(source, digest, ispec.MediaTypeImageLayer)
+	if err != nil {
+		return -1, err
+	}
+	defer reader.Close()
+
+	_, size, err := imgStore.FullBlobUpload(ctx, repo, reader, digest)
+
+	return size, err
 }
 
 func statBlob(imgStore storageTypes.ImageStore, repo string, digest godigest.Digest) (bool, int64, error) {
