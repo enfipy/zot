@@ -1207,10 +1207,16 @@ func (rh *RouteHandler) userMayMountBlob(
 
 // resolveBlobPresence returns whether digest exists for repo. By default this is
 // repo-local (StatBlob). When hydrateBlobOnRead is enabled and the caller
-// may mount, CheckBlob may hard-link from the dedupe cache into repo.
+// may mount, CheckBlob may hard-link from the dedupe cache into repo, or, in a
+// store without dedupe, copyBlobOnRead copies the blob from a repository that holds it.
 func (rh *RouteHandler) resolveBlobPresence(
 	request *http.Request, imgStore storageTypes.ImageStore, repo string, digest godigest.Digest,
 ) (bool, int64, error) {
+	if rh.isHydrateBlobOnReadEnabled(repo) &&
+		!rh.c.Config.IsDedupeEnabled(rh.c.StoreController.GetStorePath(repo)) {
+		return rh.copyBlobOnRead(request, imgStore, repo, digest)
+	}
+
 	if rh.isHydrateBlobOnReadEnabled(repo) {
 		userCanMount, err := rh.userMayMountBlob(request, imgStore, digest, repo)
 		if err != nil {

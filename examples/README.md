@@ -150,6 +150,19 @@ already holds the digest; otherwise `HEAD` / ranged `GET` stay repo-local
 (`StatBlob`) and can still return 404 for digests missing from the destination.
 A complete example is in [config-hydrate-blob-on-read.json](config-hydrate-blob-on-read.json).
 
+Without `dedupe` there is no cache to link a digest from, so `hydrateBlobOnRead`
+instead copies a blob the repository lacks, in full, from another repository of
+the same store whose tagged images MetaDB lists with that digest, as a layer or
+a config. The same access rules apply: `create` on the destination and `read`
+on the source. A pusher that asks whether the repository holds a layer before
+uploading it, as BuildKit, containerd and Docker do, then skips the upload of a
+base image's layers the registry already holds elsewhere, such as in a sync
+mirror, while every repository still holds its blobs in full rather than as
+placeholders that only the dedupe cache resolves. The copy reads and writes
+outside the store lock, one at a time per blob and repository, and finishes even
+when the client gives up first. It needs MetaDB, which zot keeps when search,
+basic authentication, retention, quotas or image trust are enabled.
+
 When an image is deleted (either by tag or reference), orphaned blobs can lead
 to wasted storage, and background garbage collection can be enabled with:
 

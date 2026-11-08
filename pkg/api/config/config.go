@@ -36,7 +36,9 @@ type StorageConfig struct {
 	RedirectBlobURL bool
 	// HydrateBlobOnRead restores the pre-conformance behavior where HEAD and ranged
 	// GET may call CheckBlob and hard-link a digest from this store's dedupe cache
-	// into the destination repository. The zero value (false) keeps blob reads
+	// into the destination repository. Without dedupe, they copy the blob in full
+	// from another repository whose images MetaDB lists with it instead. The zero
+	// value (false) keeps blob reads
 	// repo-local via StatBlob (OCI AtomicDelete / distribution-spec). Explicit
 	// mounts via POST .../blobs/uploads/?mount= are unaffected. Only applies within
 	// a single store/substore (not across SubPaths).
@@ -1345,6 +1347,25 @@ func (c *Config) IsHydrateBlobOnReadEnabled(storePath string) bool {
 	}
 
 	return c.Storage.HydrateBlobOnRead
+}
+
+// IsDedupeEnabled returns whether the store at storePath dedupes blobs. If a matching
+// subpath exists, its setting takes precedence over the global one.
+func (c *Config) IsDedupeEnabled(storePath string) bool {
+	if c == nil {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if storePath != "/" {
+		if subPathConfig, ok := c.Storage.SubPaths[storePath]; ok {
+			return subPathConfig.Dedupe
+		}
+	}
+
+	return c.Storage.Dedupe
 }
 
 // CopyExtensionsConfig returns a copy of the extensions config if it exists.
