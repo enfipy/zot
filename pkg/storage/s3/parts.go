@@ -3,7 +3,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/md5" //nolint:gosec // an ETag, as S3 makes it
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +41,10 @@ import (
 // key holds, which by then a later attempt wrote: a key put again after its first PutObject was cut
 // was there for minutes and then gone. An upload's parts are its own objects until it completes,
 // and the store completes an upload once.
+//
+// zot's own files, manifests and index.json, are written whole from memory, and go the same way,
+// their parts sent straight from that memory. The upstream driver writes them with no deadline, and
+// a held index.json, written under the store lock, stops every other write to the store with it.
 const (
 	partSize = 8 << 20
 	// The part buffers of all uploads together, 192 MiB, made only as they are first needed.
@@ -235,13 +242,54 @@ func (p *parts) upload(ctx context.Context, path string, body io.Reader) (storag
 		return nil, err
 	}
 
-	if err := up.send(ctx, first, first[:n], body); err != nil {
+	err = up.send(ctx, func(ctx context.Context, jobs chan<- part) error {
+		return up.read(ctx, jobs, first, first[:n], body)
+	})
+	if err != nil {
 		up.Abort()
 
 		return nil, err
 	}
 
 	return up, nil
+}
+
+// put writes content to path's key as a multipart upload, its parts sent straight from content, and
+// completes it.
+func (p *parts) put(ctx context.Context, path string, content []byte) error {
+	up := &partsUpload{parts: p, key: p.key(path)}
+	if int64(len(content)) > maxParts*partSize {
+		return errPartsTooLarge
+	}
+
+	if err := up.create(ctx); err != nil {
+		return err
+	}
+
+	err := up.send(ctx, func(ctx context.Context, jobs chan<- part) error {
+		// An empty content is one empty part.
+		for number, first := int64(1), 0; number == 1 || first < len(content); number, first = number+1, first+partSize {
+			data := content[first:min(first+partSize, len(content))]
+
+			select {
+			case jobs <- part{number: number, data: data}:
+				up.size += int64(len(data))
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		return nil
+	})
+	if err == nil {
+		err = up.Complete()
+	}
+
+	if err != nil {
+		up.Abort()
+	}
+
+	return err
 }
 
 // copy copies the size bytes at src's key to dst's key on the store's side, as parts of a
@@ -379,14 +427,16 @@ func (up *partsUpload) create(ctx context.Context) error {
 	})
 }
 
+// part is data to upload as the part numbered number, held in buf, one of the part buffers, unless
+// buf is nil.
 type part struct {
 	number int64
 	data   []byte
 	buf    []byte
 }
 
-// send uploads first and the rest of body as parts, uploadWorkers at a time.
-func (up *partsUpload) send(ctx context.Context, first, data []byte, body io.Reader) error {
+// send uploads the parts that feed hands it, uploadWorkers at a time.
+func (up *partsUpload) send(ctx context.Context, feed func(ctx context.Context, jobs chan<- part) error) error {
 	p := up.parts
 	jobs := make(chan part)
 	run := newRun(ctx)
@@ -413,14 +463,16 @@ func (up *partsUpload) send(ctx context.Context, first, data []byte, body io.Rea
 
 					return err
 				})
-				p.buffers <- job.buf
+				if job.buf != nil {
+					p.buffers <- job.buf
+				}
 
 				run.fail(err)
 			}
 		})
 	}
 
-	run.fail(up.read(run.ctx, jobs, first, data, body))
+	run.fail(feed(run.ctx, jobs))
 	close(jobs)
 	workers.Wait()
 
@@ -492,7 +544,7 @@ func (up *partsUpload) Complete() error {
 			head, headErr := p.client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 				Bucket: aws.String(p.bucket), Key: aws.String(up.key),
 			})
-			if headErr == nil && aws.Int64Value(head.ContentLength) == up.size {
+			if headErr == nil && up.landed(head) {
 				return nil
 			}
 		}
@@ -501,6 +553,25 @@ func (up *partsUpload) Complete() error {
 
 		return err
 	})
+}
+
+// landed is whether head, of the object at the upload's key, is the completed upload. Its ETag says
+// so, as a key rewritten in place, such as an index.json, may hold an older object of the same
+// size. A store whose parts' ETags are not their MD5s makes ETags of its own, and only the size is
+// checked.
+func (up *partsUpload) landed(head *s3.HeadObjectOutput) bool {
+	sum := md5.New() //nolint:gosec // an ETag, as S3 makes it
+
+	for _, part := range up.done {
+		raw, err := hex.DecodeString(strings.Trim(aws.StringValue(part.ETag), `"`))
+		if err != nil || len(raw) != md5.Size {
+			return aws.Int64Value(head.ContentLength) == up.size
+		}
+
+		sum.Write(raw)
+	}
+
+	return strings.Trim(aws.StringValue(head.ETag), `"`) == fmt.Sprintf("%x-%d", sum.Sum(nil), len(up.done))
 }
 
 // Abort drops the parts uploaded so far.

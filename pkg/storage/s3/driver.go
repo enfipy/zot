@@ -50,6 +50,16 @@ func (driver *partsDriver) UploadParts(ctx context.Context, path string, body io
 	return upload, driver.formatErr(err, path)
 }
 
+// WriteFile writes content as a multipart upload with deadlines, which publishes it whole or not at
+// all.
+func (driver *partsDriver) WriteFile(filepath string, content []byte) (int, error) {
+	if err := driver.parts.put(context.Background(), filepath, content); err != nil {
+		return -1, driver.formatErr(err, filepath)
+	}
+
+	return len(content), nil
+}
+
 func (driver *partsDriver) CopyParts(ctx context.Context, src, dst string, size int64,
 ) (storageTypes.PartsUpload, error) {
 	upload, err := driver.parts.copy(ctx, src, dst, size)

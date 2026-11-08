@@ -134,7 +134,8 @@ type Driver interface { //nolint:interfacebloat
 }
 
 // PartsDriver is a driver that writes and copies a whole blob straight to its place, as an
-// upload that publishes the blob only when completed.
+// upload that publishes the blob only when completed. Its WriteFile, too, publishes content whole
+// or not at all.
 type PartsDriver interface {
 	Driver
 	UploadParts(ctx context.Context, path string, body io.Reader) (PartsUpload, error)

@@ -2950,6 +2950,14 @@ func (is *ImageStore) PutIndexContent(repo string, index ispec.Index) error {
 // into place. This prevents a failed replacement from truncating the existing
 // destination and cleans up the temporary object on every failure path.
 func (is *ImageStore) writeFileViaStaging(repo, destination string, content []byte) error {
+	// A failed write of a parts driver leaves the destination as it was, and a staged write would
+	// add a copy and a delete, each a request that may be held.
+	if _, ok := is.storeDriver.(storageTypes.PartsDriver); ok {
+		_, err := is.storeDriver.WriteFile(destination, content)
+
+		return err
+	}
+
 	stagingUUID, err := guuid.NewV4()
 	if err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 	"crypto/md5" //nolint:gosec // an ETag, as S3 makes it
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,8 @@ import (
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	godigest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
@@ -33,8 +36,9 @@ import (
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
 
-// fakeS3 is a bucket that keeps completed objects in store, at keys equal to their paths. hook,
-// when set, runs before each request and may hold it or fail it.
+// fakeS3 is a bucket that keeps completed objects in store, at keys equal to their paths, and their
+// ETags in etags, as S3 makes them. hook, when set, runs before each request and may hold it or
+// fail it.
 type fakeS3 struct {
 	s3iface.S3API
 
@@ -50,12 +54,14 @@ type fakeS3 struct {
 	most      int
 	calls     map[string]int
 	completed map[string]bool
+	etags     map[string]string
 }
 
 func newFakeS3() *fakeS3 {
 	return &fakeS3{
 		store: inmemory.New(), uploads: map[string]map[int64][]byte{}, keys: map[string]string{},
 		attempts: map[string]int{}, calls: map[string]int{}, completed: map[string]bool{},
+		etags: map[string]string{},
 	}
 }
 
@@ -204,13 +210,22 @@ func (f *fakeS3) finish(id string, parts []*s3.CompletedPart) error {
 
 	var whole []byte
 
+	sum := md5.New() //nolint:gosec
+
 	for i, part := range parts {
 		if *part.PartNumber != int64(i+1) {
 			return failure("InvalidPartOrder", 400)
 		}
 
-		whole = append(whole, upload[*part.PartNumber]...)
+		data := upload[*part.PartNumber]
+		partSum := md5.Sum(data) //nolint:gosec
+		whole = append(whole, data...)
+		sum.Write(partSum[:])
 	}
+
+	f.mu.Lock()
+	f.etags[key] = fmt.Sprintf("%x-%d", sum.Sum(nil), len(parts))
+	f.mu.Unlock()
 
 	return f.store.PutContent(context.Background(), key, whole)
 }
@@ -250,12 +265,21 @@ func (f *fakeS3) AbortMultipartUploadWithContext(ctx aws.Context, in *s3.AbortMu
 
 func (f *fakeS3) HeadObjectWithContext(ctx aws.Context, in *s3.HeadObjectInput, _ ...request.Option,
 ) (*s3.HeadObjectOutput, error) {
-	info, err := f.store.Stat(ctx, *in.Key)
+	data, err := f.store.GetContent(ctx, *in.Key)
 	if err != nil {
 		return nil, failure("NotFound", 404)
 	}
 
-	return &s3.HeadObjectOutput{ContentLength: aws.Int64(info.Size())}, nil
+	f.mu.Lock()
+	etag, ok := f.etags[*in.Key]
+	f.mu.Unlock()
+
+	// An object not put together from parts, as a PutObject writes it.
+	if !ok {
+		etag = fmt.Sprintf("%x", md5.Sum(data)) //nolint:gosec
+	}
+
+	return &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(data))), ETag: aws.String(`"` + etag + `"`)}, nil
 }
 
 func (f *fakeS3) open() int {
@@ -616,6 +640,94 @@ func TestPartsCompleteCutAfterItCompleted(t *testing.T) {
 	}
 }
 
+// A cut completion followed by an answer that the upload is gone is taken for a completion only when
+// the key holds this upload, not an older object of the same size.
+func TestPartsCompleteKnowsAnOlderObject(t *testing.T) {
+	shortDeadlines(t)
+
+	fake := newFakeS3()
+	older := random(t, 1000)
+
+	if err := fake.store.PutContent(context.Background(), "/index.json", older); err != nil {
+		t.Fatal(err)
+	}
+
+	upload, err := newTestParts(fake).upload(context.Background(), "/index.json", bytes.NewReader(random(t, 1000)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The first completion is held and never lands, and the store has dropped the upload by the next.
+	fake.hook = func(ctx context.Context, op string, _ int64, attempt int) error {
+		switch {
+		case op == "complete" && attempt == 1:
+			return held(ctx)
+		case op == "complete":
+			return failure(s3.ErrCodeNoSuchUpload, 404)
+		}
+
+		return nil
+	}
+
+	if err := upload.Complete(); !isCode(err, s3.ErrCodeNoSuchUpload) {
+		t.Fatalf("completion over an older object: %v", err)
+	}
+
+	if !bytes.Equal(content(t, fake, "/index.json"), older) {
+		t.Fatal("older object changed")
+	}
+}
+
+// A file written whole from memory, as zot writes manifests and index.json, goes as parts sent
+// from that memory, with deadlines, and is completed: the fake has no PutObject.
+func TestPartsPutFromMemory(t *testing.T) {
+	shortDeadlines(t)
+
+	for _, size := range []int{0, 1000, partSize, 2*partSize + 1} {
+		fake := newFakeS3()
+		fake.hook = func(ctx context.Context, op string, number int64, attempt int) error {
+			if op == "part" && number == 1 && attempt == 1 {
+				return held(ctx)
+			}
+
+			return nil
+		}
+		p := newTestParts(fake)
+		data := random(t, size)
+
+		if err := p.put(context.Background(), "/index.json", data); err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+
+		parts := max(1, (size+partSize-1)/partSize)
+		if !bytes.Equal(content(t, fake, "/index.json"), data) || fake.count("create") != 1 ||
+			fake.count("part") != parts+1 || fake.attempt("part", 1) != 2 || fake.open() != 0 || p.made != 0 {
+			t.Fatalf("size %d: %d uploads created, %d part attempts, %d of part 1, %d open, %d buffers made",
+				size, fake.count("create"), fake.count("part"), fake.attempt("part", 1), fake.open(), p.made)
+		}
+	}
+
+	// A refused completion aborts the upload and leaves the key as it was.
+	fake := newFakeS3()
+	fake.hook = func(ctx context.Context, op string, _ int64, _ int) error {
+		if op == "complete" {
+			return failure("AccessDenied", 403)
+		}
+
+		return nil
+	}
+
+	if err := newTestParts(fake).put(context.Background(), "/index.json", random(t, 1000)); err == nil {
+		t.Fatal("put succeeded")
+	}
+
+	if fake.count("abort") != 1 || fake.open() != 0 {
+		t.Fatalf("%d aborts, %d uploads open", fake.count("abort"), fake.open())
+	}
+
+	absent(t, fake, "/index.json")
+}
+
 // A store that speaks HTTP/2 picks it when the client offers it, so the client must not offer it.
 func TestPartsTransportSpeaksHTTP1(t *testing.T) {
 	var (
@@ -733,5 +845,83 @@ func TestImageStoreUploadsAndCopiesInParts(t *testing.T) {
 
 	if _, err := copier.CopyBlob(ctx, "repo", "third", godigest.FromString("missing")); !errors.Is(err, zerr.ErrBlobNotFound) {
 		t.Fatalf("missing source: %v", err)
+	}
+}
+
+// A manifest and the index.json that tags it are written in parts with deadlines, index.json
+// straight to its key with no staged copy.
+func TestImageStoreWritesMetadataInParts(t *testing.T) {
+	shortDeadlines(t)
+
+	fake := newFakeS3()
+	store := newPartsStore(t, fake)
+	ctx := context.Background()
+
+	config, err := json.Marshal(ispec.Image{
+		Platform: ispec.Platform{Architecture: "amd64", OS: "linux"},
+		RootFS:   ispec.RootFS{Type: "layers", DiffIDs: []godigest.Digest{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	layer := random(t, 1000)
+
+	for _, blob := range [][]byte{config, layer} {
+		if _, _, err := store.FullBlobUpload(ctx, "repo", bytes.NewReader(blob), godigest.FromBytes(blob)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manifest, err := json.Marshal(ispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ispec.MediaTypeImageManifest,
+		Config: ispec.Descriptor{
+			MediaType: ispec.MediaTypeImageConfig, Digest: godigest.FromBytes(config), Size: int64(len(config)),
+		},
+		Layers: []ispec.Descriptor{{
+			MediaType: ispec.MediaTypeImageLayer, Digest: godigest.FromBytes(layer), Size: int64(len(layer)),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every part is held at its first attempt.
+	fake.hook = func(ctx context.Context, op string, _ int64, attempt int) error {
+		if op == "part" && attempt%2 == 1 {
+			return held(ctx)
+		}
+
+		return nil
+	}
+	completed, parts := fake.count("complete"), fake.count("part")
+
+	digest, _, err := store.PutImageManifest(ctx, "repo", "v1", ispec.MediaTypeImageManifest, manifest, nil)
+	if err != nil || digest != godigest.FromBytes(manifest) {
+		t.Fatalf("put manifest: %s, %v", digest, err)
+	}
+
+	// The manifest and index.json, each held once.
+	if fake.count("complete")-completed != 2 || fake.count("part")-parts != 4 {
+		t.Fatalf("%d uploads completed, %d part attempts", fake.count("complete")-completed, fake.count("part")-parts)
+	}
+
+	if !bytes.Equal(content(t, fake, "/zot/repo/blobs/sha256/"+digest.Encoded()), manifest) {
+		t.Fatal("manifest differs")
+	}
+
+	var index ispec.Index
+	if err := json.Unmarshal(content(t, fake, "/zot/repo/index.json"), &index); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(index.Manifests) != 1 || index.Manifests[0].Digest != digest ||
+		index.Manifests[0].Annotations[ispec.AnnotationRefName] != "v1" {
+		t.Fatalf("index.json: %+v", index.Manifests)
+	}
+
+	if uploads, _ := fake.store.List(ctx, "/zot/repo/.uploads"); len(uploads) != 0 {
+		t.Fatalf("staged files left: %v", uploads)
 	}
 }
