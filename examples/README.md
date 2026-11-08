@@ -174,7 +174,8 @@ for a copied part, growing by half after each such attempt) is sent again at
 once, and one answered with an error after a growing wait, for up to 15
 minutes, as a store can hold every request for one key for minutes. A copy is
 made on the storage's side, part by part. Neither is staged under `.uploads`
-and moved.
+and moved. A blob is done only when its slowest part is, so a sync writes four
+of an image's blobs at once.
 These requests go over HTTP/1.1, a connection each, since over HTTP/2 they would
 share one connection whose flow-control window held parts can use up.
 

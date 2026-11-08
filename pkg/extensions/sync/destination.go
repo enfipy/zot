@@ -17,6 +17,7 @@ import (
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/regclient/regclient/types/mediatype"
 	"github.com/regclient/regclient/types/ref"
+	"golang.org/x/sync/errgroup"
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/common"
@@ -231,19 +232,15 @@ func (registry *DestinationRegistry) copyManifest(repo string, desc ispec.Descri
 			return err
 		}
 
-		for _, blob := range manifest.Layers {
-			if storageCommon.IsNonDistributable(blob.MediaType) {
-				continue
-			}
+		blobs := make([]ispec.Descriptor, 0, len(manifest.Layers)+1)
 
-			err := registry.copyBlob(repo, blob, tempImageStore)
-			if err != nil {
-				return err
+		for _, blob := range manifest.Layers {
+			if !storageCommon.IsNonDistributable(blob.MediaType) {
+				blobs = append(blobs, blob)
 			}
 		}
 
-		err := registry.copyBlob(repo, manifest.Config, tempImageStore)
-		if err != nil {
+		if err := registry.copyBlobs(repo, append(blobs, manifest.Config), tempImageStore); err != nil {
 			return err
 		}
 
@@ -347,14 +344,47 @@ func (registry *DestinationRegistry) copyManifest(repo string, desc ispec.Descri
 	return nil
 }
 
+// blobsAtOnce is how many blobs of an image are copied at once. A store may hold one write of a blob
+// for minutes, and the blob is done only when that write is, so the image's other blobs go on.
+const blobsAtOnce = 4
+
+// copyBlobs copies blobs from one image store to another, blobsAtOnce at a time, and stops at the
+// first that fails.
+func (registry *DestinationRegistry) copyBlobs(repo string, blobs []ispec.Descriptor,
+	tempImageStore storageTypes.ImageStore,
+) error {
+	group, ctx := errgroup.WithContext(context.Background())
+	group.SetLimit(blobsAtOnce)
+
+	seen := make(map[godigest.Digest]bool, len(blobs))
+
+	for _, blob := range blobs {
+		// An image may list a blob more than once, and two writes of one key at once may leave none.
+		if seen[blob.Digest] {
+			continue
+		}
+
+		seen[blob.Digest] = true
+
+		group.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			return registry.copyBlob(ctx, repo, blob, tempImageStore)
+		})
+	}
+
+	return group.Wait()
+}
+
 // Copy a blob from one image store to another image store.
-func (registry *DestinationRegistry) copyBlob(repo string, blob ispec.Descriptor,
+func (registry *DestinationRegistry) copyBlob(ctx context.Context, repo string, blob ispec.Descriptor,
 	tempImageStore storageTypes.ImageStore,
 ) error {
 	blobDigest, blobMediaType := blob.Digest, blob.MediaType
 
 	imageStore := registry.storeController.GetImageStore(repo)
-	ctx := context.Background()
 	// The descriptor gives the expected size, so the check doesn't have to look the blob up
 	// in every manifest of the destination repo.
 	if found, _, _ := imageStore.CheckBlobWithSize(ctx, repo, blobDigest, blob.Size); found {
