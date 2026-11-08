@@ -45,6 +45,8 @@ import (
 // zot's own files, manifests and index.json, are written whole from memory, and go the same way,
 // their parts sent straight from that memory. The upstream driver writes them with no deadline, and
 // a held index.json, written under the store lock, stops every other write to the store with it.
+// The same holds for zot's reads under that lock, of index.json and a manifest and the stat of a
+// blob, so these small reads, which are safe to send again, have deadlines too.
 const (
 	partSize = 8 << 20
 	// The part buffers of all uploads together, 192 MiB, made only as they are first needed.
@@ -75,8 +77,12 @@ var (
 	partPolicy = policy{first: 5 * time.Second, last: time.Minute, patience: 15 * time.Minute} //nolint:gochecknoglobals
 	// A copied part reads its range of the source, and a store that holds the read holds every attempt
 	// at that range, so a copied part has as long as the store takes to answer it with 504.
-	copyPolicy     = policy{first: 2 * time.Minute, last: 3 * time.Minute, patience: 15 * time.Minute} //nolint:gochecknoglobals
+	copyPolicy = policy{first: 2 * time.Minute, last: 3 * time.Minute, patience: 15 * time.Minute} //nolint:gochecknoglobals
+	// A store may take a minute or more to put many parts together. A Complete of one part has
+	// nothing to put together, nine in ten take under a second, and it goes as a part does.
 	completePolicy = policy{first: 2 * time.Minute, last: 5 * time.Minute, patience: 15 * time.Minute} //nolint:gochecknoglobals
+	// A small read or a stat mostly takes well under a second.
+	readPolicy = policy{first: 5 * time.Second, last: time.Minute, patience: 15 * time.Minute} //nolint:gochecknoglobals
 	// An abort only frees the store's space, which it frees by itself in time.
 	abortPolicy = policy{first: 20 * time.Second, last: 20 * time.Second, patience: time.Minute} //nolint:gochecknoglobals
 )
@@ -290,6 +296,85 @@ func (p *parts) put(ctx context.Context, path string, content []byte) error {
 	}
 
 	return err
+}
+
+// get reads the whole object at path's key, which is small, as zot reads whole only its own files.
+func (p *parts) get(ctx context.Context, path string) ([]byte, error) {
+	var content []byte
+
+	err := try(ctx, "read "+p.key(path), readPolicy, func(ctx context.Context) error {
+		out, err := p.client.GetObjectWithContext(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(p.bucket), Key: aws.String(p.key(path)),
+		})
+		if err != nil {
+			return err
+		}
+
+		defer out.Body.Close()
+
+		content, err = io.ReadAll(out.Body)
+
+		return err
+	})
+
+	return content, err
+}
+
+// stat says what path is, as the upstream driver does: the object at its key, or else, as the store
+// answers a HEAD of a key with only keys under it with NotFound, a directory if a key starts with
+// it.
+func (p *parts) stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
+	key := p.key(path)
+	info := storagedriver.FileInfoFields{Path: path}
+
+	err := try(ctx, "stat "+key, readPolicy, func(ctx context.Context) error {
+		out, err := p.client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(p.bucket), Key: aws.String(key),
+		})
+		if err == nil {
+			info.Size, info.ModTime = aws.Int64Value(out.ContentLength), aws.TimeValue(out.LastModified)
+		}
+
+		return err
+	})
+	if err == nil {
+		return storagedriver.FileInfoInternal{FileInfoFields: info}, nil
+	}
+
+	// Only an answer, such as NotFound or Forbidden, sends it on to the listing.
+	var failure awserr.RequestFailure
+	if !errors.As(err, &failure) || retryable(err) {
+		return nil, err
+	}
+
+	found := false
+	err = try(ctx, "list "+key, readPolicy, func(ctx context.Context) error {
+		out, err := p.client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(p.bucket), Prefix: aws.String(key), MaxKeys: aws.Int64(1),
+		})
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case len(out.Contents) == 1 && aws.StringValue(out.Contents[0].Key) == key:
+			found = true
+			info.Size, info.ModTime = aws.Int64Value(out.Contents[0].Size), aws.TimeValue(out.Contents[0].LastModified)
+		case len(out.Contents) == 1 || len(out.CommonPrefixes) == 1:
+			found, info.IsDir = true, true
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if !found {
+		return nil, storagedriver.PathNotFoundError{Path: path}
+	}
+
+	return storagedriver.FileInfoInternal{FileInfoFields: info}, nil
 }
 
 // copy copies the size bytes at src's key to dst's key on the store's side, as parts of a
@@ -534,7 +619,12 @@ func (up *partsUpload) Complete() error {
 
 	attempted := false
 
-	return try(ctx, "complete upload of "+up.key, completePolicy, func(ctx context.Context) error {
+	limits := completePolicy
+	if len(up.done) == 1 {
+		limits = partPolicy
+	}
+
+	return try(ctx, "complete upload of "+up.key, limits, func(ctx context.Context) error {
 		_, err := p.client.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(p.bucket), Key: aws.String(up.key), UploadId: aws.String(up.id),
 			MultipartUpload: &s3.CompletedMultipartUpload{Parts: up.done},

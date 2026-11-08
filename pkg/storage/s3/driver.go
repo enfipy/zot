@@ -60,6 +60,33 @@ func (driver *partsDriver) WriteFile(filepath string, content []byte) (int, erro
 	return len(content), nil
 }
 
+// ReadFile reads a small file with deadlines. zot reads whole only its own files, index.json,
+// manifests, configs and markers, some of them under the store lock.
+func (driver *partsDriver) ReadFile(path string) ([]byte, error) {
+	content, err := driver.parts.get(context.Background(), path)
+	if err != nil {
+		return nil, driver.formatErr(err, path)
+	}
+
+	return content, nil
+}
+
+// Stat stats path with deadlines.
+func (driver *partsDriver) Stat(path string) (storagedriver.FileInfo, error) {
+	info, err := driver.parts.stat(context.Background(), path)
+	if err != nil {
+		return nil, driver.formatErr(err, path)
+	}
+
+	return info, nil
+}
+
+func (driver *partsDriver) DirExists(path string) bool {
+	info, err := driver.parts.stat(context.Background(), path)
+
+	return err == nil && info.IsDir()
+}
+
 func (driver *partsDriver) CopyParts(ctx context.Context, src, dst string, size int64,
 ) (storageTypes.PartsUpload, error) {
 	upload, err := driver.parts.copy(ctx, src, dst, size)

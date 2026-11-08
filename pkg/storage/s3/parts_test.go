@@ -32,6 +32,7 @@ import (
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
 	"zotregistry.dev/zot/v2/pkg/log"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	"zotregistry.dev/zot/v2/pkg/storage/imagestore"
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
@@ -265,6 +266,13 @@ func (f *fakeS3) AbortMultipartUploadWithContext(ctx aws.Context, in *s3.AbortMu
 
 func (f *fakeS3) HeadObjectWithContext(ctx aws.Context, in *s3.HeadObjectInput, _ ...request.Option,
 ) (*s3.HeadObjectOutput, error) {
+	defer f.end()
+
+	if err := f.begin(ctx, "head", 0); err != nil {
+		return nil, err
+	}
+
+	// A directory is no object, and its key is NotFound.
 	data, err := f.store.GetContent(ctx, *in.Key)
 	if err != nil {
 		return nil, failure("NotFound", 404)
@@ -282,6 +290,52 @@ func (f *fakeS3) HeadObjectWithContext(ctx aws.Context, in *s3.HeadObjectInput, 
 	return &s3.HeadObjectOutput{ContentLength: aws.Int64(int64(len(data))), ETag: aws.String(`"` + etag + `"`)}, nil
 }
 
+func (f *fakeS3) GetObjectWithContext(ctx aws.Context, in *s3.GetObjectInput, _ ...request.Option,
+) (*s3.GetObjectOutput, error) {
+	defer f.end()
+
+	if err := f.begin(ctx, "get", 0); err != nil {
+		return nil, err
+	}
+
+	data, err := f.store.GetContent(ctx, *in.Key)
+	if err != nil {
+		return nil, failure("NoSuchKey", 404)
+	}
+
+	return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(data))}, nil
+}
+
+// ListObjectsV2WithContext answers a listing of at most one key: the key equal to the prefix, or
+// else one under it.
+func (f *fakeS3) ListObjectsV2WithContext(ctx aws.Context, in *s3.ListObjectsV2Input, _ ...request.Option,
+) (*s3.ListObjectsV2Output, error) {
+	defer f.end()
+
+	if err := f.begin(ctx, "list", 0); err != nil {
+		return nil, err
+	}
+
+	out := &s3.ListObjectsV2Output{}
+
+	info, err := f.store.Stat(ctx, *in.Prefix)
+	if err != nil {
+		return out, nil //nolint:nilerr // nothing has that prefix
+	}
+
+	if !info.IsDir() {
+		out.Contents = []*s3.Object{{Key: in.Prefix, Size: aws.Int64(info.Size()), LastModified: aws.Time(info.ModTime())}}
+
+		return out, nil
+	}
+
+	if children, err := f.store.List(ctx, *in.Prefix); err == nil && len(children) > 0 {
+		out.Contents = []*s3.Object{{Key: aws.String(children[0])}}
+	}
+
+	return out, nil
+}
+
 func (f *fakeS3) open() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -292,11 +346,13 @@ func (f *fakeS3) open() int {
 func shortDeadlines(t *testing.T) {
 	t.Helper()
 
-	part, copied, complete, abort := partPolicy, copyPolicy, completePolicy, abortPolicy
+	part, copied, complete, abort, read := partPolicy, copyPolicy, completePolicy, abortPolicy, readPolicy
 	short := policy{first: 100 * time.Millisecond, last: 100 * time.Millisecond, patience: 10 * time.Second}
-	partPolicy, copyPolicy, completePolicy, abortPolicy = short, short, short, short
+	partPolicy, copyPolicy, completePolicy, abortPolicy, readPolicy = short, short, short, short, short
 
-	t.Cleanup(func() { partPolicy, copyPolicy, completePolicy, abortPolicy = part, copied, complete, abort })
+	t.Cleanup(func() {
+		partPolicy, copyPolicy, completePolicy, abortPolicy, readPolicy = part, copied, complete, abort, read
+	})
 }
 
 func random(t *testing.T, size int) []byte {
@@ -675,6 +731,116 @@ func TestPartsCompleteKnowsAnOlderObject(t *testing.T) {
 
 	if !bytes.Equal(content(t, fake, "/index.json"), older) {
 		t.Fatal("older object changed")
+	}
+}
+
+// A Complete of one part has a part's deadline, not the minutes of one that puts many together.
+func TestPartsCompleteOfOnePartHasAPartsDeadline(t *testing.T) {
+	shortDeadlines(t)
+
+	completePolicy = policy{first: time.Minute, last: time.Minute, patience: time.Minute}
+	fake := newFakeS3()
+	fake.hook = func(ctx context.Context, op string, _ int64, attempt int) error {
+		if op == "complete" && attempt == 1 {
+			return held(ctx)
+		}
+
+		return nil
+	}
+
+	start := time.Now()
+	if err := newTestParts(fake).put(context.Background(), "/index.json", random(t, 1000)); err != nil {
+		t.Fatal(err)
+	}
+
+	if took := time.Since(start); took > 10*time.Second || fake.attempt("complete", 0) != 2 {
+		t.Fatalf("%d completions in %s", fake.attempt("complete", 0), took)
+	}
+}
+
+// Small reads and stats have deadlines, and say what the upstream driver says of a file, a
+// directory and a missing path.
+func TestPartsReadAndStat(t *testing.T) {
+	shortDeadlines(t)
+
+	fake := newFakeS3()
+	driver := &partsDriver{Driver: New(fake.store), parts: newTestParts(fake)}
+	data := random(t, 1000)
+
+	if err := fake.store.PutContent(context.Background(), "/repo/index.json", data); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each request is held at its first attempt.
+	fake.hook = func(ctx context.Context, op string, _ int64, attempt int) error {
+		if attempt == 1 {
+			return held(ctx)
+		}
+
+		return nil
+	}
+
+	if got, err := driver.ReadFile("/repo/index.json"); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("read: %v", err)
+	}
+
+	if info, err := driver.Stat("/repo/index.json"); err != nil || info.IsDir() || info.Size() != int64(len(data)) ||
+		info.Path() != "/repo/index.json" {
+		t.Fatalf("stat of a file: %+v, %v", info, err)
+	}
+
+	if info, err := driver.Stat("/repo"); err != nil || !info.IsDir() || !driver.DirExists("/repo") {
+		t.Fatalf("stat of a directory: %+v, %v", info, err)
+	}
+
+	if fake.attempt("get", 0) != 2 || fake.attempt("head", 0) < 2 || fake.attempt("list", 0) < 2 {
+		t.Fatalf("%d gets, %d heads, %d lists", fake.attempt("get", 0), fake.attempt("head", 0), fake.attempt("list", 0))
+	}
+
+	if _, err := driver.ReadFile("/repo/missing"); !errclass.IsStorageObjectMissing(err) {
+		t.Fatalf("read of a missing file: %v", err)
+	}
+
+	if _, err := driver.Stat("/repo/missing"); !errclass.IsStorageObjectMissing(err) || driver.DirExists("/repo/missing") {
+		t.Fatalf("stat of a missing file: %v", err)
+	}
+}
+
+// A stat the store keeps failing fails, and does not take the path for missing, so zot does not
+// write a new index.json over the one there.
+func TestPartsFailedStatIsNotMissing(t *testing.T) {
+	shortDeadlines(t)
+
+	readPolicy = policy{first: 50 * time.Millisecond, last: 50 * time.Millisecond, patience: 300 * time.Millisecond}
+	fake := newFakeS3()
+	store := newPartsStore(t, fake)
+	ctx := context.Background()
+
+	if err := store.InitRepo(ctx, "repo"); err != nil {
+		t.Fatal(err)
+	}
+
+	index := []byte(`{"schemaVersion":2,"manifests":[{"digest":"sha256:0"}]}`)
+	if err := fake.store.PutContent(ctx, "/zot/repo/index.json", index); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.hook = func(_ context.Context, op string, _ int64, _ int) error {
+		if op == "head" || op == "list" {
+			return failure("InternalError", 500)
+		}
+
+		return nil
+	}
+	lists := fake.count("list")
+
+	err := store.InitRepo(ctx, "repo")
+	if err == nil || errclass.IsStorageObjectMissing(err) || fake.count("list") != lists {
+		t.Fatalf("init over a failing stat: %v, %d lists", err, fake.count("list")-lists)
+	}
+
+	if !bytes.Equal(content(t, fake, "/zot/repo/index.json"), index) {
+		t.Fatal("index.json written over")
 	}
 }
 

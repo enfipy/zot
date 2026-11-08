@@ -262,6 +262,11 @@ func (is *ImageStore) initRepo(ctx context.Context, name string) error {
 	// "oci-layout" file - create if it doesn't exist
 	ilPath := path.Join(repoDir, ispec.ImageLayoutFile)
 	if _, err := is.storeDriver.Stat(ilPath); err != nil {
+		// A stat that failed says nothing of the file, which may hold what a write would lose.
+		if !errclass.IsStorageObjectMissing(err) {
+			return err
+		}
+
 		il := ispec.ImageLayout{Version: ispec.ImageLayoutVersion}
 
 		buf, err := json.Marshal(il)
@@ -281,6 +286,10 @@ func (is *ImageStore) initRepo(ctx context.Context, name string) error {
 	// "index.json" file - create if it doesn't exist
 	indexPath := path.Join(repoDir, ispec.ImageIndexFile)
 	if _, err := is.storeDriver.Stat(indexPath); err != nil {
+		if !errclass.IsStorageObjectMissing(err) {
+			return err
+		}
+
 		index := ispec.Index{SchemaVersion: 2}
 
 		buf, err := json.Marshal(index)
