@@ -1925,6 +1925,10 @@ func (is *ImageStore) publishParts(ctx context.Context, repo, dst string, upload
 // blobs copies it on the storage's side, from the blob as it was checked when written; otherwise
 // it is read and uploaded again.
 func (is *ImageStore) CopyBlob(ctx context.Context, source, repo string, digest godigest.Digest) (int64, error) {
+	if cloner, ok := is.storeDriver.(storageTypes.CloneDriver); ok && !is.dedupe {
+		return is.cloneBlob(ctx, cloner, source, repo, digest)
+	}
+
 	driver, ok := is.storeDriver.(storageTypes.PartsDriver)
 	if !ok || is.dedupe {
 		reader, _, err := is.GetBlob(source, digest, ispec.MediaTypeImageLayer)
@@ -1979,6 +1983,66 @@ func (is *ImageStore) CopyBlob(ctx context.Context, source, repo string, digest 
 	}
 
 	return binfo.Size(), is.publishParts(ctx, repo, dst, upload)
+}
+
+// cloneBlob copies digest's blob from the source repository to repo by cloning its file, which
+// shares the source's blocks on a filesystem with reflinks, then moves the clone into repo's blob
+// store under the store lock, as an upload's last step does. The source was checked when it was
+// written, and a clone holds its bytes.
+func (is *ImageStore) cloneBlob(ctx context.Context, cloner storageTypes.CloneDriver, source, repo string,
+	digest godigest.Digest,
+) (int64, error) {
+	if err := digest.Validate(); err != nil {
+		return -1, err
+	}
+
+	var lockLatency time.Time
+
+	is.RLock(&lockLatency)
+	binfo, err := is.originalBlobInfo(source, digest)
+	is.RUnlock(&lockLatency)
+
+	if err != nil {
+		return -1, err
+	}
+
+	u, err := guuid.NewV4()
+	if err != nil {
+		return -1, err
+	}
+
+	staged := is.BlobUploadPath(repo, u.String())
+	if err := is.uploads.startInProgress(staged); err != nil {
+		return -1, err
+	}
+	defer is.uploads.finishInProgress(staged)
+
+	if err := is.prepareBlobUploadDir(ctx, repo); err != nil {
+		return -1, err
+	}
+
+	if err := cloner.Clone(binfo.Path(), staged); err != nil {
+		is.log.Error().Err(err).Str("blob", binfo.Path()).Str("dst", staged).Msg("failed to clone blob")
+
+		return -1, mapStorageErr(err)
+	}
+
+	is.Lock(&lockLatency)
+	defer is.Unlock(&lockLatency)
+
+	if err := is.initRepo(ctx, repo); err != nil {
+		_ = is.storeDriver.Delete(staged)
+
+		return -1, err
+	}
+
+	if err := is.storeDriver.Move(staged, is.BlobPath(repo, digest)); err != nil {
+		_ = is.storeDriver.Delete(staged)
+
+		return -1, mapStorageErr(err)
+	}
+
+	return binfo.Size(), nil
 }
 
 // DedupeBlob's repo argument is unused: the shared content is checked against the verified

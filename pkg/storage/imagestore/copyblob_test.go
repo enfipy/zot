@@ -85,3 +85,37 @@ func TestCheckBlobSelfHealCopyBlobFailsOnInvalidRepo(t *testing.T) {
 		So(ok, ShouldBeFalse)
 	})
 }
+
+func TestCopyBlobClonesWithoutDedupe(t *testing.T) {
+	Convey("CopyBlob clones a blob between repositories of a local store without dedupe", t, func() {
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewMetricsServer(false, log)
+		t.Cleanup(metrics.Stop)
+
+		imgStore := imagestore.NewImageStore(t.TempDir(), t.TempDir(), false, false, log, metrics, nil,
+			local.New(true), nil, nil, nil)
+		copier, ok := imgStore.(storageTypes.BlobCopier)
+		So(ok, ShouldBeTrue)
+
+		content := []byte("copyblob-clone-content")
+		digest := godigest.FromBytes(content)
+
+		_, _, err := imgStore.FullBlobUpload(context.Background(), "repoa", bytes.NewReader(content), digest)
+		So(err, ShouldBeNil)
+
+		size, err := copier.CopyBlob(context.Background(), "repoa", "repob", digest)
+		So(err, ShouldBeNil)
+		So(size, ShouldEqual, int64(len(content)))
+
+		blobContent, err := imgStore.GetBlobContent("repob", digest)
+		So(err, ShouldBeNil)
+		So(blobContent, ShouldResemble, content)
+
+		blobContent, err = imgStore.GetBlobContent("repoa", digest)
+		So(err, ShouldBeNil)
+		So(blobContent, ShouldResemble, content)
+
+		_, err = copier.CopyBlob(context.Background(), "repoa", "repoc", godigest.FromString("missing"))
+		So(err, ShouldNotBeNil)
+	})
+}

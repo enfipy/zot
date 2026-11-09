@@ -388,6 +388,46 @@ func (driver *Driver) Link(src, dest string) error {
 	return nil
 }
 
+// Clone copies src to a new file at dst, sharing src's blocks where the filesystem clones files
+// (Btrfs, XFS) and copying its bytes elsewhere. dst must not exist yet.
+func (driver *Driver) Clone(src, dst string) error {
+	if err := os.MkdirAll(path.Dir(dst), storageConstants.DefaultDirPerms); err != nil {
+		return driver.formatErr(err)
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return driver.formatErr(storagedriver.PathNotFoundError{Path: src})
+		}
+
+		return driver.formatErr(err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, storageConstants.DefaultFilePerms)
+	if err != nil {
+		return driver.formatErr(err)
+	}
+
+	err = cloneFile(out, in)
+	if err == nil && driver.commit {
+		err = out.Sync()
+	}
+
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+
+	if err != nil {
+		_ = os.Remove(dst)
+
+		return driver.formatErr(err)
+	}
+
+	return nil
+}
+
 func (driver *Driver) RedirectURL(_ *http.Request, _ string) (string, error) {
 	return "", nil
 }

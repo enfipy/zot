@@ -149,6 +149,12 @@ type PartsUpload interface {
 	Abort()
 }
 
+// CloneDriver is a driver that copies a file by sharing its blocks with the source, as a
+// filesystem's reflink does, and copies it byte by byte where the filesystem cannot.
+type CloneDriver interface {
+	Clone(src, dst string) error
+}
+
 // BlobCopier is an image store that copies a blob from one of its repositories to another.
 type BlobCopier interface {
 	CopyBlob(ctx context.Context, source, repo string, digest godigest.Digest) (int64, error)
